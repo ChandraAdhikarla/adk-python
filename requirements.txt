@@ -1,0 +1,6 @@
+fastapi>=0.115.0
+uvicorn>=0.34.0
+pydantic>=2.0.0
+google-adk  # This will install the Agent Development Kit
+python-multipart  # For handling form data 
+cassandra-driver>=3.28.0  # For ScyllaDB connectivity 

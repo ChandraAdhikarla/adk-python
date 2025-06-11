@@ -1,0 +1,1 @@
+# Package for ScyllaDB schema initialization 
