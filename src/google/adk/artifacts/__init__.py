@@ -14,8 +14,12 @@
 
 from .base_artifact_service import BaseArtifactService
 from .scylla_artifact_service import ScyllaArtifactService
+from .gcs_artifact_service import GcsArtifactService
+from .in_memory_artifact_service import InMemoryArtifactService
 
 __all__ = [
     'BaseArtifactService',
+    'GcsArtifactService',
+    'InMemoryArtifactService',
     'ScyllaArtifactService',
 ]

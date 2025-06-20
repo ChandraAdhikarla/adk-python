@@ -3,6 +3,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python Unit Tests](https://github.com/google/adk-python/actions/workflows/python-unit-tests.yml/badge.svg)](https://github.com/google/adk-python/actions/workflows/python-unit-tests.yml)
 [![r/agentdevelopmentkit](https://img.shields.io/badge/Reddit-r%2Fagentdevelopmentkit-FF4500?style=flat&logo=reddit&logoColor=white)](https://www.reddit.com/r/agentdevelopmentkit/)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/google/adk-python)
 
 <html>
     <h2 align="center">
@@ -13,8 +14,10 @@
     </h3>
     <h3 align="center">
       Important Links:
-      <a href="https://google.github.io/adk-docs/">Docs</a> &
-      <a href="https://github.com/google/adk-samples">Samples</a>.
+      <a href="https://google.github.io/adk-docs/">Docs</a>, 
+      <a href="https://github.com/google/adk-samples">Samples</a>,
+      <a href="https://github.com/google/adk-java">Java ADK</a> &
+      <a href="https://github.com/google/adk-web">ADK Web</a>.
     </h3>
 </html>
 
@@ -38,6 +41,12 @@ Agent Development Kit (ADK) is a flexible and modular framework for developing a
 - **Deploy Anywhere**: Easily containerize and deploy agents on Cloud Run or
   scale seamlessly with Vertex AI Agent Engine.
 
+## 🤖 Agent2Agent (A2A) Protocol and ADK Integration
+
+For remote agent-to-agent communication, ADK integrates with the
+[A2A protocol](https://github.com/google-a2a/A2A/).
+See this [example](https://github.com/google-a2a/a2a-samples/tree/main/samples/python/agents/google_adk)
+for how they can work together.
 
 ## 🚀 Installation
 
@@ -123,26 +132,15 @@ adk eval \
     samples_for_testing/hello_world/hello_world_eval_set_001.evalset.json
 ```
 
-## 🤖 A2A and ADK integration
-
-For remote agent-to-agent communication, ADK integrates with the
-[A2A protocol](https://github.com/google/A2A/).
-See this [example](https://github.com/google/A2A/tree/main/samples/python/agents/google_adk)
-for how they can work together.
-
 ## 🤝 Contributing
 
-We welcome contributions from the community! Whether it's bug reports, feature requests, documentation improvements, or code contributions, please see our 
+We welcome contributions from the community! Whether it's bug reports, feature requests, documentation improvements, or code contributions, please see our
 - [General contribution guideline and flow](https://google.github.io/adk-docs/contributing-guide/#questions).
 - Then if you want to contribute code, please read [Code Contributing Guidelines](./CONTRIBUTING.md) to get started.
 
 ## 📄 License
 
 This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details.
-
-## Preview
-
-This feature is subject to the "Pre-GA Offerings Terms" in the General Service Terms section of the [Service Specific Terms](https://cloud.google.com/terms/service-terms#1). Pre-GA features are available "as is" and might have limited support. For more information, see the [launch stage descriptions](https://cloud.google.com/products?hl=en#product-launch-stages).
 
 ---
 

@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
 
 import base64
 import json
 import logging
-import os
-import datetime
 from typing import Any
 from typing import AsyncGenerator
 from typing import cast
@@ -32,6 +31,7 @@ from typing import Union
 from google.genai import types
 from litellm import acompletion
 from litellm import ChatCompletionAssistantMessage
+from litellm import ChatCompletionAssistantToolCall
 from litellm import ChatCompletionDeveloperMessage
 from litellm import ChatCompletionImageUrlObject
 from litellm import ChatCompletionMessageToolCall
@@ -53,7 +53,7 @@ from .base_llm import BaseLlm
 from .llm_request import LlmRequest
 from .llm_response import LlmResponse
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("google_adk." + __name__)
 
 _NEW_LINE = "\n"
 _EXCLUDED_PART_FIELD = {"inline_data": {"data"}}
@@ -63,10 +63,17 @@ class FunctionChunk(BaseModel):
   id: Optional[str]
   name: Optional[str]
   args: Optional[str]
+  index: Optional[int] = 0
 
 
 class TextChunk(BaseModel):
   text: str
+
+
+class UsageMetadataChunk(BaseModel):
+  prompt_tokens: int
+  completion_tokens: int
+  total_tokens: int
 
 
 class LiteLLMClient:
@@ -131,7 +138,7 @@ def _safe_json_serialize(obj) -> str:
 
   try:
     # Try direct JSON serialization first
-    return json.dumps(obj)
+    return json.dumps(obj, ensure_ascii=False)
   except (TypeError, OverflowError):
     return str(obj)
 
@@ -174,21 +181,29 @@ def _content_to_message_param(
     tool_calls = []
     content_present = False
     for part in content.parts:
-        if part.function_call:
-            tool_calls.append(
-                ChatCompletionMessageToolCall(
-                    type="function",
-                    id=part.function_call.id,
-                    function=Function(
-                        name=part.function_call.name,
-                        arguments=part.function_call.args,
-                    ),
-                )
+      if part.function_call:
+        tool_calls.append(
+            ChatCompletionAssistantToolCall(
+                type="function",
+                id=part.function_call.id,
+                function=Function(
+                    name=part.function_call.name,
+                    arguments=_safe_json_serialize(part.function_call.args),
+                ),
             )
-        elif part.text or part.inline_data:
-            content_present = True
+        )
+      elif part.text or part.inline_data:
+        content_present = True
 
     final_content = message_content if content_present else None
+    if final_content and isinstance(final_content, list):
+      # when the content is a single text object, we can use it directly.
+      # this is needed for ollama_chat provider which fails if content is a list
+      final_content = (
+          final_content[0].get("text", "")
+          if final_content[0].get("type", None) == "text"
+          else final_content
+      )
 
     return ChatCompletionAssistantMessage(
         role=role,
@@ -346,15 +361,20 @@ def _function_declaration_to_tool_param(
 def _model_response_to_chunk(
     response: ModelResponse,
 ) -> Generator[
-    Tuple[Optional[Union[TextChunk, FunctionChunk]], Optional[str]], None, None
+    Tuple[
+        Optional[Union[TextChunk, FunctionChunk, UsageMetadataChunk]],
+        Optional[str],
+    ],
+    None,
+    None,
 ]:
-  """Converts a litellm message to text or function chunk.
+  """Converts a litellm message to text, function or usage metadata chunk.
 
   Args:
     response: The response from the model.
 
   Yields:
-    A tuple of text or function chunk and finish reason.
+    A tuple of text or function or usage metadata chunk and finish reason.
   """
 
   message = None
@@ -376,6 +396,7 @@ def _model_response_to_chunk(
               id=tool_call.id,
               name=tool_call.function.name,
               args=tool_call.function.arguments,
+              index=tool_call.index,
           ), finish_reason
 
     if finish_reason and not (
@@ -386,15 +407,24 @@ def _model_response_to_chunk(
   if not message:
     yield None, None
 
+  # Ideally usage would be expected with the last ModelResponseStream with a
+  # finish_reason set. But this is not the case we are observing from litellm.
+  # So we are sending it as a separate chunk to be set on the llm_response.
+  if response.get("usage", None):
+    yield UsageMetadataChunk(
+        prompt_tokens=response["usage"].get("prompt_tokens", 0),
+        completion_tokens=response["usage"].get("completion_tokens", 0),
+        total_tokens=response["usage"].get("total_tokens", 0),
+    ), None
+
 
 def _model_response_to_generate_content_response(
-    response: ModelResponse, declared_tool_names: Optional[list[str]] = None
+    response: ModelResponse,
 ) -> LlmResponse:
-  """Converts a litellm response to LlmResponse.
+  """Converts a litellm response to LlmResponse. Also adds usage metadata.
 
   Args:
     response: The model response.
-    declared_tool_names: A list of declared tool names for the current LLM call.
 
   Returns:
     The LlmResponse.
@@ -406,130 +436,25 @@ def _model_response_to_generate_content_response(
 
   if not message:
     raise ValueError("No message in response")
-  return _message_to_generate_content_response(
-      message, declared_tool_names=declared_tool_names
-  )
 
-
-def _deduce_function_names_from_concatenation(
-    mangled_name: str,
-    arg_count: int,
-    known_tool_names: Optional[list[str]],
-) -> list[str]:
-  """Attempts to deduce individual function names from a concatenated string.
-
-  Args:
-    mangled_name: The concatenated string of function names.
-    arg_count: The expected number of function names (should match arg sets).
-    known_tool_names: A list of valid tool names.
-
-  Returns:
-    A list of deduced function names. If deduction fails or is partial,
-    it returns a list of [mangled_name] * arg_count.
-  """
-  if not known_tool_names or not mangled_name:
-    return [mangled_name] * arg_count
-
-  deduced_names = []
-  remaining_mangled_name = mangled_name
-  # Sort known_tool_names by length descending to match longest possible names first
-  sorted_known_tool_names = sorted(known_tool_names, key=len, reverse=True)
-
-  for i in range(arg_count):
-    found_match_for_segment = False
-    for tool_name in sorted_known_tool_names:
-      if remaining_mangled_name.startswith(tool_name):
-        # Check if this is the last segment and if it consumes the rest of the string,
-        # or if there are more segments to find.
-        if i == arg_count - 1: # Last segment
-          if remaining_mangled_name == tool_name: # Exact match for the remainder
-            deduced_names.append(tool_name)
-            remaining_mangled_name = ""
-            found_match_for_segment = True
-            break
-          # else: it starts with tool_name but there's more, not a clean match for last segment
-        else: # Not the last segment
-          deduced_names.append(tool_name)
-          remaining_mangled_name = remaining_mangled_name[len(tool_name) :]
-          found_match_for_segment = True
-          break # Move to the next segment of the mangled name
-    
-    if not found_match_for_segment:
-      # If any segment cannot be matched, the overall deduction is considered failed.
-      logger.warning(
-          f"Failed to deduce function name for segment {i+1} from '{mangled_name}'. "
-          f"Remaining part: '{remaining_mangled_name}'. Deduced so far: {deduced_names}."
-      )
-      return [mangled_name] * arg_count # Fallback to original mangled name for all parts
-
-  # Final check: all segments deduced and the entire mangled string is consumed.
-  if len(deduced_names) == arg_count and not remaining_mangled_name.strip():
-    logger.info(f"Successfully deduced function names: {deduced_names} from '{mangled_name}'.")
-    return deduced_names
-  else:
-    logger.warning(
-        f"Could not fully segment mangled name '{mangled_name}' into {arg_count} known tool names. "
-        f"Deduced: {deduced_names}. Remainder: '{remaining_mangled_name}'."
+  llm_response = _message_to_generate_content_response(message)
+  if response.get("usage", None):
+    llm_response.usage_metadata = types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=response["usage"].get("prompt_tokens", 0),
+        candidates_token_count=response["usage"].get("completion_tokens", 0),
+        total_token_count=response["usage"].get("total_tokens", 0),
     )
-    return [mangled_name] * arg_count
-
-
-def _try_parse_concatenated_json(json_str: str) -> list[Any]:
-  """Attempts to parse a string that might contain one or more JSON objects concatenated.
-
-  Args:
-    json_str: The string to parse.
-
-  Returns:
-    A list of parsed JSON objects. Returns an empty list if parsing fails early
-    or a list with one item if it's a single valid JSON.
-  """
-  results = []
-  decoder = json.JSONDecoder()
-  idx = 0
-  s = json_str.strip() # Remove leading/trailing whitespace from the whole string
-
-  while idx < len(s):
-    try:
-      # Skip any leading whitespace for the current object
-      current_char_idx = idx
-      while current_char_idx < len(s) and s[current_char_idx].isspace():
-        current_char_idx +=1
-      if current_char_idx == len(s): # Only whitespace remaining
-          break
-
-      obj, end_idx = decoder.raw_decode(s, current_char_idx)
-      results.append(obj)
-      idx = end_idx
-    except json.JSONDecodeError:
-      # If we've already parsed at least one object, and the rest is invalid,
-      # return what we have. Otherwise, this indicates the string itself is not
-      # starting with a valid JSON or is malformed in a way we can't split.
-      if not results:
-          # This means the very first attempt to decode failed.
-          # Re-raise to be caught by the caller's original try-except.
-          raise
-      # If there was an error after parsing at least one object,
-      # it means the remaining part is not valid JSON. Stop and return current results.
-      logger.warning(
-          f"Partial success in parsing concatenated JSON. Parsed {len(results)} objects. "
-          f"Remaining unparsable content: >>>{s[idx:]}<<<"
-      )
-      break
-  return results
+  return llm_response
 
 
 def _message_to_generate_content_response(
-    message: Message,
-    is_partial: bool = False,
-    declared_tool_names: Optional[list[str]] = None,
+    message: Message, is_partial: bool = False
 ) -> LlmResponse:
   """Converts a litellm message to LlmResponse.
 
   Args:
     message: The message to convert.
     is_partial: Whether the message is partial.
-    declared_tool_names: A list of declared tool names for the current LLM call.
 
   Returns:
     The LlmResponse.
@@ -542,83 +467,12 @@ def _message_to_generate_content_response(
   if message.get("tool_calls", None):
     for tool_call in message.get("tool_calls"):
       if tool_call.type == "function":
-        original_function_name = tool_call.function.name
-        arguments_str = tool_call.function.arguments or "{}"
-        tool_call_id_str = tool_call.id
-        
-        parsed_arg_list = []
-        try:
-          # Attempt to parse as one or more concatenated JSON objects
-          parsed_arg_list = _try_parse_concatenated_json(arguments_str)
-          if not parsed_arg_list and arguments_str != "{}": # If empty list and not empty string, means it failed initial parse
-              # This case should be caught by the JSONDecodeError in _try_parse_concatenated_json
-              # and re-raised if arguments_str was not parseable at all.
-              # If arguments_str was "{}", parsed_arg_list would be [{}] by json.loads or empty by our parser (if {} is invalid alone)
-              # Let's ensure that an empty arguments_str ("{}") results in a single empty dict.
-              if arguments_str == "{}":
-                  parsed_arg_list = [{}] # Treat "{}" as a single empty JSON object
-              else: # Should have been a JSONDecodeError from _try_parse_concatenated_json
-                  raise json.JSONDecodeError("Failed to parse arguments", arguments_str, 0)
-
-
-        except json.JSONDecodeError as e:
-          logger.error(
-              "Failed to decode JSON from tool_call.function.arguments. "
-              f"Content was: >>>{arguments_str}<<<"
-          )
-          logger.error(
-              f"Error for tool_call_id='{tool_call_id_str}', function_name='{original_function_name}'. Exception: {e}"
-          )
-          raise # Re-raise the original error if parsing completely fails
-
-        if not parsed_arg_list: # e.g. arguments_str was empty or "{}" which resolved to [{}] and then maybe not.
-             # This case handles if arguments_str was truly empty or just "{}".
-             # An empty string for arguments is not valid JSON. "{}" is.
-            if arguments_str.strip() == "": # Truly empty, not even "{}"
-                logger.warning(f"Empty arguments string for tool_call_id='{tool_call_id_str}', function_name='{original_function_name}'. Using empty dict.")
-                parsed_arg_list = [{}] 
-            elif arguments_str.strip() == "{}":
-                 parsed_arg_list = [{}]
-
-
-        if len(parsed_arg_list) == 1:
-          # Standard case: one function call, one set of arguments
-          part = types.Part.from_function_call(
-              name=original_function_name,
-              args=parsed_arg_list[0],
-          )
-          part.function_call.id = tool_call_id_str
-          parts.append(part)
-        elif len(parsed_arg_list) > 1:
-          logger.warning(
-              f"Detected {len(parsed_arg_list)} argument sets in a single tool call "
-              f"(id='{tool_call_id_str}', name='{original_function_name}'). "
-              "Splitting into multiple tool calls."
-          )
-          
-          # Attempt to deduce function names using the new logic
-          function_names_to_use = _deduce_function_names_from_concatenation(
-              original_function_name, len(parsed_arg_list), declared_tool_names
-          )
-
-          for i, arg_set in enumerate(parsed_arg_list):
-            part = types.Part.from_function_call(
-                name=function_names_to_use[i], # Use deduced or original name
-                args=arg_set,
-            )
-            part.function_call.id = f"{tool_call_id_str}_{i+1}"
-            parts.append(part)
-        # If parsed_arg_list is empty (e.g. from "{}"), and it was not an error condition.
-        # This case should be handled by the initial check for arguments_str == "{}" becoming [{}]
-        # or an empty string becoming [{}] with a warning.
-        # If it's still empty here, it implies an unhandled edge case or non-JSON "{}" (which is unlikely).
-        elif not parsed_arg_list and arguments_str.strip() == "{}": #Specifically for "{}" that became empty list
-             part = types.Part.from_function_call(
-                name=original_function_name,
-                args={},)
-             part.function_call.id = tool_call_id_str
-             parts.append(part)
-
+        part = types.Part.from_function_call(
+            name=tool_call.function.name,
+            args=json.loads(tool_call.function.arguments or "{}"),
+        )
+        part.function_call.id = tool_call.id
+        parts.append(part)
 
   return LlmResponse(
       content=types.Content(role="model", parts=parts), partial=is_partial
@@ -634,15 +488,15 @@ def _get_completion_inputs(
     llm_request: The LlmRequest to convert.
 
   Returns:
-    The litellm inputs (message list and tool dictionary).
+    The litellm inputs (message list, tool dictionary and response format).
   """
   messages = []
   for content in llm_request.contents or []:
     message_param_or_list = _content_to_message_param(content)
     if isinstance(message_param_or_list, list):
-        messages.extend(message_param_or_list)
-    elif message_param_or_list: # Ensure it's not None before appending
-        messages.append(message_param_or_list)
+      messages.extend(message_param_or_list)
+    elif message_param_or_list:  # Ensure it's not None before appending
+      messages.append(message_param_or_list)
 
   if llm_request.config.system_instruction:
     messages.insert(
@@ -663,7 +517,13 @@ def _get_completion_inputs(
         _function_declaration_to_tool_param(tool)
         for tool in llm_request.config.tools[0].function_declarations
     ]
-  return messages, tools
+
+  response_format = None
+
+  if llm_request.config.response_schema:
+    response_format = llm_request.config.response_schema
+
+  return messages, tools, response_format
 
 
 def _build_function_declaration_log(
@@ -724,89 +584,19 @@ def _build_request_log(req: LlmRequest) -> str:
       for content in req.contents
   ]
 
-  return ""
-
-
-def _log_chat_history_to_file(llm_request, model_type: str = "LiteLLM", agent_name: str = None):
-  """Logs chat history to a dedicated file for debugging purposes.
-  
-  Args:
-    llm_request: The LLM request containing conversation history
-    model_type: Type of model making the request (e.g., "Google LLM", "LiteLLM")
-    agent_name: Name of the agent from the agent tree making this request
-  """
-  try:
-    # Create logs directory if it doesn't exist
-    log_dir = "chat_history_logs"
-    os.makedirs(log_dir, exist_ok=True)
-    
-    # Create filename with timestamp
-    timestamp = datetime.datetime.now().strftime("%Y%m%d")
-    log_file = os.path.join(log_dir, f"chat_history_{timestamp}.log")
-    
-    # Determine agent identifier
-    agent_identifier = agent_name if agent_name else "Unknown Agent"
-    
-    with open(log_file, "a", encoding="utf-8") as f:
-      f.write(f"\n{'='*100}\n")
-      f.write(f"AGENT: {agent_identifier}\n")
-      f.write(f"TIMESTAMP: {datetime.datetime.now().isoformat()}\n")
-      f.write(f"MODEL: {llm_request.model} ({model_type})\n")
-      f.write(f"{'='*100}\n\n")
-      
-      # Log available tools
-      if llm_request.config.tools:
-        f.write("AVAILABLE TOOLS:\n")
-        for tool in llm_request.config.tools:
-          if hasattr(tool, 'function_declarations'):
-            for func_decl in tool.function_declarations:
-              f.write(f"  • {func_decl.name}: {func_decl.description}\n")
-        f.write(f"{'-'*80}\n\n")
-      
-      # Log conversation history with agent context
-      f.write(f"CHAT HISTORY FOR {agent_identifier}:\n")
-      for i, content in enumerate(llm_request.contents):
-        # Determine if this is the agent or user/system
-        if content.role == 'user':
-          role_display = "USER"
-        elif content.role == 'model':
-          role_display = f"{agent_identifier} (AGENT)"
-        else:
-          role_display = content.role.upper()
-          
-        f.write(f"\n[{i+1}] {role_display}:\n")
-        
-        for j, part in enumerate(content.parts):
-          if part.function_call:
-            args_dict = dict(part.function_call.args) if hasattr(part.function_call, 'args') else {}
-            f.write(f"  → Calling Tool: {part.function_call.name}\n")
-            f.write(f"    Arguments: {json.dumps(args_dict, indent=4, ensure_ascii=False)}\n")
-            
-          elif part.function_response:
-            response_data = part.function_response.response if hasattr(part.function_response, 'response') else 'no response'
-            f.write(f"  ← Tool Response: {part.function_response.name}\n")
-            if isinstance(response_data, (dict, list)):
-              f.write(f"    Result: {json.dumps(response_data, indent=4, ensure_ascii=False)}\n")
-            else:
-              f.write(f"    Result: {str(response_data)}\n")
-            
-          elif part.text:
-            # Split long text into readable chunks
-            text_content = part.text.strip()
-            if len(text_content) > 200:
-              f.write(f"  Message: {text_content[:200]}...\n")
-              f.write(f"  [Full message length: {len(text_content)} characters]\n")
-            else:
-              f.write(f"  Message: {text_content}\n")
-            
-          elif part.inline_data:
-            f.write(f"  📎 Attachment: {part.inline_data.mime_type if hasattr(part.inline_data, 'mime_type') else 'unknown type'}\n")
-            f.write(f"    Size: {len(str(part.inline_data.data)) if hasattr(part.inline_data, 'data') else 'unknown'} bytes\n")
-      
-      f.write(f"\n{'='*100}\n\n")
-      
-  except Exception as e:
-    logger.warning(f"Failed to log chat history to file: {e}")
+  return f"""
+LLM Request:
+-----------------------------------------------------------
+System Instruction:
+{req.config.system_instruction}
+-----------------------------------------------------------
+Contents:
+{_NEW_LINE.join(contents_logs)}
+-----------------------------------------------------------
+Functions:
+{_NEW_LINE.join(function_logs)}
+-----------------------------------------------------------
+"""
 
 
 class LiteLlm(BaseLlm):
@@ -830,7 +620,6 @@ class LiteLlm(BaseLlm):
   Attributes:
     model: The name of the LiteLlm model.
     llm_client: The LLM client to use for the model.
-    model_config: The model config.
   """
 
   llm_client: LiteLLMClient = Field(default_factory=LiteLLMClient)
@@ -854,10 +643,6 @@ class LiteLlm(BaseLlm):
     self._additional_args.pop("tools", None)
     # public api called from runner determines to stream or not
     self._additional_args.pop("stream", None)
-    
-    # Add a default timeout if not specified
-    if "timeout" not in self._additional_args:
-        self._additional_args["timeout"] = 300  # 5 minutes
 
   async def generate_content_async(
       self, llm_request: LlmRequest, stream: bool = False
@@ -872,45 +657,51 @@ class LiteLlm(BaseLlm):
       LlmResponse: The model response.
     """
 
-    # Log chat history to file for debugging
-    _log_chat_history_to_file(llm_request, "LiteLLM")
+    self._maybe_append_user_content(llm_request)
+    logger.debug(_build_request_log(llm_request))
 
-    logger.info(_build_request_log(llm_request))
-
-    messages, tools = _get_completion_inputs(llm_request)
-    
-    tool_declarations = (
-        llm_request.config.tools[0].function_declarations
-        if llm_request.config.tools
-        and llm_request.config.tools[0].function_declarations
-        else []
-    )
-    current_tool_names = [
-        tool.name for tool in tool_declarations if tool.name
-    ]
-
+    messages, tools, response_format = _get_completion_inputs(llm_request)
 
     completion_args = {
         "model": self.model,
         "messages": messages,
         "tools": tools,
+        "response_format": response_format,
     }
     completion_args.update(self._additional_args)
 
     if stream:
       text = ""
-      function_name = ""
-      function_args = ""
-      function_id = None
+      # Track function calls by index
+      function_calls = {}  # index -> {name, args, id}
       completion_args["stream"] = True
+      aggregated_llm_response = None
+      aggregated_llm_response_with_tool_call = None
+      usage_metadata = None
+      fallback_index = 0
       for part in self.llm_client.completion(**completion_args):
         for chunk, finish_reason in _model_response_to_chunk(part):
           if isinstance(chunk, FunctionChunk):
+            index = chunk.index or fallback_index
+            if index not in function_calls:
+              function_calls[index] = {"name": "", "args": "", "id": None}
+
             if chunk.name:
-              function_name += chunk.name
+              function_calls[index]["name"] += chunk.name
             if chunk.args:
-              function_args += chunk.args
-            function_id = chunk.id or function_id
+              function_calls[index]["args"] += chunk.args
+
+              # check if args is completed (workaround for improper chunk
+              # indexing)
+              try:
+                json.loads(function_calls[index]["args"])
+                fallback_index += 1
+              except json.JSONDecodeError:
+                pass
+
+            function_calls[index]["id"] = (
+                chunk.id or function_calls[index]["id"] or str(index)
+            )
           elif isinstance(chunk, TextChunk):
             text += chunk.text
             yield _message_to_generate_content_response(
@@ -919,41 +710,65 @@ class LiteLlm(BaseLlm):
                     content=chunk.text,
                 ),
                 is_partial=True,
-                declared_tool_names=current_tool_names,
             )
-          if finish_reason == "tool_calls" and function_id:
-            yield _message_to_generate_content_response(
-                ChatCompletionAssistantMessage(
-                    role="assistant",
-                    content="",
-                    tool_calls=[
-                        ChatCompletionMessageToolCall(
-                            type="function",
-                            id=function_id,
-                            function=Function(
-                                name=function_name,
-                                arguments=function_args,
-                            ),
-                        )
-                    ],
-                ),
-                declared_tool_names=current_tool_names,
+          elif isinstance(chunk, UsageMetadataChunk):
+            usage_metadata = types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=chunk.prompt_tokens,
+                candidates_token_count=chunk.completion_tokens,
+                total_token_count=chunk.total_tokens,
             )
-            function_name = ""
-            function_args = ""
-            function_id = None
+
+          if (
+              finish_reason == "tool_calls" or finish_reason == "stop"
+          ) and function_calls:
+            tool_calls = []
+            for index, func_data in function_calls.items():
+              if func_data["id"]:
+                tool_calls.append(
+                    ChatCompletionMessageToolCall(
+                        type="function",
+                        id=func_data["id"],
+                        function=Function(
+                            name=func_data["name"],
+                            arguments=func_data["args"],
+                            index=index,
+                        ),
+                    )
+                )
+            aggregated_llm_response_with_tool_call = (
+                _message_to_generate_content_response(
+                    ChatCompletionAssistantMessage(
+                        role="assistant",
+                        content=text,
+                        tool_calls=tool_calls,
+                    )
+                )
+            )
+            text = ""
+            function_calls.clear()
           elif finish_reason == "stop" and text:
-            yield _message_to_generate_content_response(
-                ChatCompletionAssistantMessage(role="assistant", content=text),
-                declared_tool_names=current_tool_names,
+            aggregated_llm_response = _message_to_generate_content_response(
+                ChatCompletionAssistantMessage(role="assistant", content=text)
             )
             text = ""
 
+      # waiting until streaming ends to yield the llm_response as litellm tends
+      # to send chunk that contains usage_metadata after the chunk with
+      # finish_reason set to tool_calls or stop.
+      if aggregated_llm_response:
+        if usage_metadata:
+          aggregated_llm_response.usage_metadata = usage_metadata
+          usage_metadata = None
+        yield aggregated_llm_response
+
+      if aggregated_llm_response_with_tool_call:
+        if usage_metadata:
+          aggregated_llm_response_with_tool_call.usage_metadata = usage_metadata
+        yield aggregated_llm_response_with_tool_call
+
     else:
       response = await self.llm_client.acompletion(**completion_args)
-      yield _model_response_to_generate_content_response(
-          response, declared_tool_names=current_tool_names
-      )
+      yield _model_response_to_generate_content_response(response)
 
   @staticmethod
   @override

@@ -58,50 +58,6 @@ class _ContentLlmRequestProcessor(BaseLlmRequestProcessor):
 request_processor = _ContentLlmRequestProcessor()
 
 
-def _merge_contents(contents: list[types.Content]) -> list[types.Content]:
-  """Merges contents with the same role, respecting Google's function call turn-taking rules."""
-  if not contents:
-    return []
-
-  merged_contents = [contents[0]]
-  for content in contents[1:]:
-    last_content = merged_contents[-1]
-    
-    # Do not merge if the previous content has a function_call, as it must be
-    # the last part of the content for Google's turn-taking requirements
-    has_function_call = (
-        last_content.parts and 
-        any(part.function_call for part in last_content.parts)
-    )
-    
-    # Do not merge if current content has function_response and previous doesn't,
-    # or vice versa, to maintain proper function call/response pairing
-    last_has_function_response = (
-        last_content.parts and 
-        any(part.function_response for part in last_content.parts)
-    )
-    current_has_function_response = (
-        content.parts and 
-        any(part.function_response for part in content.parts)
-    )
-    
-    # Special case: Always merge user text that comes after function response
-    # This is critical for Google's turn-taking requirements
-    should_merge_after_function_response = (
-        last_content.role == 'user' and content.role == 'user' and
-        last_has_function_response and not current_has_function_response
-    )
-    
-    # Only merge if same role AND no function call conflicts AND (function response consistency OR special case)
-    if (last_content.role == content.role and 
-        not has_function_call and 
-        (last_has_function_response == current_has_function_response or should_merge_after_function_response)):
-      merged_contents[-1].parts.extend(content.parts)
-    else:
-      merged_contents.append(content)
-  return merged_contents
-
-
 def _rearrange_events_for_async_function_responses_in_history(
     events: list[Event],
 ) -> list[Event]:
@@ -214,10 +170,10 @@ def _rearrange_events_for_latest_function_response(
   for idx in range(function_call_event_idx + 1, len(events) - 1):
     event = events[idx]
     function_responses = event.get_function_responses()
-    if (
-        function_responses
-        and function_responses[0].id in function_responses_ids
-    ):
+    if function_responses and any([
+        function_response.id in function_responses_ids
+        for function_response in function_responses
+    ]):
       function_response_events.append(event)
   function_response_events.append(events[-1])
 
@@ -246,8 +202,14 @@ def _get_contents(
   # Parse the events, leaving the contents and the function calls and
   # responses from the current agent.
   for event in events:
-    if not event.content or not event.content.role:
-      # Skip events without content, or generated neither by user nor by model.
+    if (
+        not event.content
+        or not event.content.role
+        or not event.content.parts
+        or event.content.parts[0].text == ''
+    ):
+      # Skip events without content, or generated neither by user nor by model
+      # or has empty text.
       # E.g. events purely for mutating session states.
       continue
     if not _is_event_belongs_to_branch(current_branch, event):
@@ -273,7 +235,6 @@ def _get_contents(
     content = copy.deepcopy(event.content)
     remove_client_function_call_id(content)
     contents.append(content)
-  # contents = _merge_contents(contents)
   return contents
 
 

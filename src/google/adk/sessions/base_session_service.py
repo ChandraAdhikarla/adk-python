@@ -35,13 +35,8 @@ class ListSessionsResponse(BaseModel):
 
   The events and states are not set within each Session object.
   """
+
   sessions: list[Session] = Field(default_factory=list)
-
-
-class ListEventsResponse(BaseModel):
-  """The response of listing events in a session."""
-  events: list[Event] = Field(default_factory=list)
-  next_page_token: Optional[str] = None
 
 
 class BaseSessionService(abc.ABC):
@@ -51,7 +46,7 @@ class BaseSessionService(abc.ABC):
   """
 
   @abc.abstractmethod
-  def create_session(
+  async def create_session(
       self,
       *,
       app_name: str,
@@ -72,10 +67,9 @@ class BaseSessionService(abc.ABC):
     Returns:
       session: The newly created session instance.
     """
-    pass
 
   @abc.abstractmethod
-  def get_session(
+  async def get_session(
       self,
       *,
       app_name: str,
@@ -124,7 +118,7 @@ class BaseSessionService(abc.ABC):
     session.events.append(event)
     return event
 
-  def __update_session_state(self, session: Session, event: Event):
+  def __update_session_state(self, session: Session, event: Event) -> None:
     """Updates the session state based on the event."""
     if not event.actions or not event.actions.state_delta:
       return

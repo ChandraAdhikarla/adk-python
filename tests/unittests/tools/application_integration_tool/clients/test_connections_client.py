@@ -74,9 +74,12 @@ class TestConnectionsClient:
     mock_response.raise_for_status.return_value = None
     mock_response.json.return_value = {"data": "test"}
 
-    with mock.patch.object(
-        client, "_get_access_token", return_value=mock_credentials.token
-    ), mock.patch("requests.get", return_value=mock_response):
+    with (
+        mock.patch.object(
+            client, "_get_access_token", return_value=mock_credentials.token
+        ),
+        mock.patch("requests.get", return_value=mock_response),
+    ):
       response = client._execute_api_call("https://test.url")
       assert response.json() == {"data": "test"}
       requests.get.assert_called_once_with(
@@ -121,9 +124,12 @@ class TestConnectionsClient:
         f"HTTP error {status_code}: {response_text}"
     )
 
-    with mock.patch.object(
-        client, "_get_access_token", return_value=mock_credentials.token
-    ), mock.patch("requests.get", return_value=mock_response):
+    with (
+        mock.patch.object(
+            client, "_get_access_token", return_value=mock_credentials.token
+        ),
+        mock.patch("requests.get", return_value=mock_response),
+    ):
       with pytest.raises(
           ValueError, match="Invalid request. Please check the provided"
       ):
@@ -140,9 +146,12 @@ class TestConnectionsClient:
         "Internal Server Error"
     )
 
-    with mock.patch.object(
-        client, "_get_access_token", return_value=mock_credentials.token
-    ), mock.patch("requests.get", return_value=mock_response):
+    with (
+        mock.patch.object(
+            client, "_get_access_token", return_value=mock_credentials.token
+        ),
+        mock.patch("requests.get", return_value=mock_response),
+    ):
       with pytest.raises(ValueError, match="Request error: "):
         client._execute_api_call("https://test.url")
 
@@ -151,10 +160,13 @@ class TestConnectionsClient:
   ):
     credentials = {"email": "test@example.com"}
     client = ConnectionsClient(project, location, connection_name, credentials)
-    with mock.patch.object(
-        client, "_get_access_token", return_value=mock_credentials.token
-    ), mock.patch(
-        "requests.get", side_effect=Exception("Something went wrong")
+    with (
+        mock.patch.object(
+            client, "_get_access_token", return_value=mock_credentials.token
+        ),
+        mock.patch(
+            "requests.get", side_effect=Exception("Something went wrong")
+        ),
     ):
       with pytest.raises(
           Exception, match="An unexpected error occurred: Something went wrong"
@@ -169,6 +181,7 @@ class TestConnectionsClient:
     mock_response = mock.MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = {
+        "name": "test-connection",
         "serviceDirectory": "test_service",
         "host": "test.host",
         "tlsServiceDirectory": "tls_test_service",
@@ -180,12 +193,37 @@ class TestConnectionsClient:
     ):
       details = client.get_connection_details()
       assert details == {
+          "name": "test-connection",
           "serviceName": "tls_test_service",
           "host": "test.host",
           "authOverrideEnabled": True,
       }
 
   def test_get_connection_details_success_without_host(
+      self, project, location, connection_name, mock_credentials
+  ):
+    credentials = {"email": "test@example.com"}
+    client = ConnectionsClient(project, location, connection_name, credentials)
+    mock_response = mock.MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "name": "test-connection",
+        "serviceDirectory": "test_service",
+        "authOverrideEnabled": False,
+    }
+
+    with mock.patch.object(
+        client, "_execute_api_call", return_value=mock_response
+    ):
+      details = client.get_connection_details()
+      assert details == {
+          "name": "test-connection",
+          "serviceName": "test_service",
+          "host": "",
+          "authOverrideEnabled": False,
+      }
+
+  def test_get_connection_details_without_name(
       self, project, location, connection_name, mock_credentials
   ):
     credentials = {"email": "test@example.com"}
@@ -202,6 +240,7 @@ class TestConnectionsClient:
     ):
       details = client.get_connection_details()
       assert details == {
+          "name": "",
           "serviceName": "test_service",
           "host": "",
           "authOverrideEnabled": False,
@@ -419,21 +458,21 @@ class TestConnectionsClient:
   def test_create_operation(self):
     operation = ConnectionsClient.create_operation("Entity1", "test_tool")
     assert "post" in operation
-    assert operation["post"]["summary"] == "Create Entity1"
+    assert operation["post"]["summary"] == "Creates a new Entity1"
     assert "operationId" in operation["post"]
     assert operation["post"]["operationId"] == "test_tool_create_Entity1"
 
   def test_update_operation(self):
     operation = ConnectionsClient.update_operation("Entity1", "test_tool")
     assert "post" in operation
-    assert operation["post"]["summary"] == "Update Entity1"
+    assert operation["post"]["summary"] == "Updates the Entity1"
     assert "operationId" in operation["post"]
     assert operation["post"]["operationId"] == "test_tool_update_Entity1"
 
   def test_delete_operation(self):
     operation = ConnectionsClient.delete_operation("Entity1", "test_tool")
     assert "post" in operation
-    assert operation["post"]["summary"] == "Delete Entity1"
+    assert operation["post"]["summary"] == "Delete the Entity1"
     assert operation["post"]["operationId"] == "test_tool_delete_Entity1"
 
   def test_create_operation_request(self):
@@ -449,6 +488,7 @@ class TestConnectionsClient:
     assert schema["type"] == "object"
     assert "properties" in schema
     assert "entityId" in schema["properties"]
+    assert "filterClause" in schema["properties"]
 
   def test_get_operation_request_static(self):
     schema = ConnectionsClient.get_operation_request()
@@ -463,6 +503,7 @@ class TestConnectionsClient:
     assert schema["type"] == "object"
     assert "properties" in schema
     assert "entityId" in schema["properties"]
+    assert "filterClause" in schema["properties"]
 
   def test_list_operation_request(self):
     schema = ConnectionsClient.list_operation_request()
@@ -470,6 +511,7 @@ class TestConnectionsClient:
     assert schema["type"] == "object"
     assert "properties" in schema
     assert "filterClause" in schema["properties"]
+    assert "sortByColumns" in schema["properties"]
 
   def test_action_request(self):
     schema = ConnectionsClient.action_request("TestAction")
@@ -539,10 +581,13 @@ class TestConnectionsClient:
     mock_creds.token = "sa_token"
     mock_creds.expired = False
 
-    with mock.patch(
-        "google.oauth2.service_account.Credentials.from_service_account_info",
-        return_value=mock_creds,
-    ), mock.patch.object(mock_creds, "refresh", return_value=None):
+    with (
+        mock.patch(
+            "google.oauth2.service_account.Credentials.from_service_account_info",
+            return_value=mock_creds,
+        ),
+        mock.patch.object(mock_creds, "refresh", return_value=None),
+    ):
       token = client._get_access_token()
       assert token == "sa_token"
       google.oauth2.service_account.Credentials.from_service_account_info.assert_called_once_with(
@@ -555,10 +600,13 @@ class TestConnectionsClient:
       self, project, location, connection_name, mock_credentials
   ):
     client = ConnectionsClient(project, location, connection_name, None)
-    with mock.patch(
-        "google.adk.tools.application_integration_tool.clients.connections_client.default_service_credential",
-        return_value=(mock_credentials, "test_project_id"),
-    ), mock.patch.object(mock_credentials, "refresh", return_value=None):
+    with (
+        mock.patch(
+            "google.adk.tools.application_integration_tool.clients.connections_client.default_service_credential",
+            return_value=(mock_credentials, "test_project_id"),
+        ),
+        mock.patch.object(mock_credentials, "refresh", return_value=None),
+    ):
       token = client._get_access_token()
       assert token == "test_token"
 

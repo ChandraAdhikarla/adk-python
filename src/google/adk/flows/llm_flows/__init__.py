@@ -17,3 +17,4 @@ from . import _nl_planning
 from . import contents
 from . import functions
 from . import identity
+from . import instructions

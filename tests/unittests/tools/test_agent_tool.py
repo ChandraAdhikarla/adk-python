@@ -13,19 +13,14 @@
 # limitations under the License.
 
 from google.adk.agents import Agent
+from google.adk.agents import SequentialAgent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.tools.agent_tool import AgentTool
 from google.genai.types import Part
 from pydantic import BaseModel
-import pytest
 from pytest import mark
 
-from .. import utils
-
-pytestmark = pytest.mark.skip(
-    reason='Skipping until tool.func evaluations are fixed (async)'
-)
-
+from .. import testing_utils
 
 function_call_custom = Part.from_function_call(
     name='tool_agent', args={'custom_input': 'test1'}
@@ -50,7 +45,7 @@ def change_state_callback(callback_context: CallbackContext):
 
 
 def test_no_schema():
-  mock_model = utils.MockModel.create(
+  mock_model = testing_utils.MockModel.create(
       responses=[
           function_call_no_schema,
           'response1',
@@ -69,9 +64,9 @@ def test_no_schema():
       tools=[AgentTool(agent=tool_agent)],
   )
 
-  runner = utils.InMemoryRunner(root_agent)
+  runner = testing_utils.InMemoryRunner(root_agent)
 
-  assert utils.simplify_events(runner.run('test1')) == [
+  assert testing_utils.simplify_events(runner.run('test1')) == [
       ('root_agent', function_call_no_schema),
       ('root_agent', function_response_no_schema),
       ('root_agent', 'response2'),
@@ -81,7 +76,7 @@ def test_no_schema():
 def test_update_state():
   """The agent tool can read and change parent state."""
 
-  mock_model = utils.MockModel.create(
+  mock_model = testing_utils.MockModel.create(
       responses=[
           function_call_no_schema,
           '{"custom_output": "response1"}',
@@ -102,7 +97,7 @@ def test_update_state():
       tools=[AgentTool(agent=tool_agent)],
   )
 
-  runner = utils.InMemoryRunner(root_agent)
+  runner = testing_utils.InMemoryRunner(root_agent)
   runner.session.state['state_1'] = 'state1_value'
 
   runner.run('test1')
@@ -110,6 +105,55 @@ def test_update_state():
       'input: changed_value' in mock_model.requests[1].config.system_instruction
   )
   assert runner.session.state['state_1'] == 'changed_value'
+
+
+def test_update_artifacts():
+  """The agent tool can read and write artifacts."""
+
+  async def before_tool_agent(callback_context: CallbackContext):
+    # Artifact 1 should be available in the tool agent.
+    artifact = await callback_context.load_artifact('artifact_1')
+    await callback_context.save_artifact(
+        'artifact_2', Part.from_text(text=artifact.text + ' 2')
+    )
+
+  tool_agent = SequentialAgent(
+      name='tool_agent',
+      before_agent_callback=before_tool_agent,
+  )
+
+  async def before_main_agent(callback_context: CallbackContext):
+    await callback_context.save_artifact(
+        'artifact_1', Part.from_text(text='test')
+    )
+
+  async def after_main_agent(callback_context: CallbackContext):
+    # Artifact 2 should be available after the tool agent.
+    artifact_2 = await callback_context.load_artifact('artifact_2')
+    await callback_context.save_artifact(
+        'artifact_3', Part.from_text(text=artifact_2.text + ' 3')
+    )
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[function_call_no_schema, 'response2']
+  )
+  root_agent = Agent(
+      name='root_agent',
+      before_agent_callback=before_main_agent,
+      after_agent_callback=after_main_agent,
+      tools=[AgentTool(agent=tool_agent)],
+      model=mock_model,
+  )
+
+  runner = testing_utils.InMemoryRunner(root_agent)
+  runner.run('test1')
+
+  artifacts_path = f'test_app/test_user/{runner.session_id}'
+  assert runner.runner.artifact_service.artifacts == {
+      f'{artifacts_path}/artifact_1': [Part.from_text(text='test')],
+      f'{artifacts_path}/artifact_2': [Part.from_text(text='test 2')],
+      f'{artifacts_path}/artifact_3': [Part.from_text(text='test 2 3')],
+  }
 
 
 @mark.parametrize(
@@ -128,7 +172,7 @@ def test_custom_schema():
   class CustomOutput(BaseModel):
     custom_output: str
 
-  mock_model = utils.MockModel.create(
+  mock_model = testing_utils.MockModel.create(
       responses=[
           function_call_custom,
           '{"custom_output": "response1"}',
@@ -150,10 +194,10 @@ def test_custom_schema():
       tools=[AgentTool(agent=tool_agent)],
   )
 
-  runner = utils.InMemoryRunner(root_agent)
+  runner = testing_utils.InMemoryRunner(root_agent)
   runner.session.state['state_1'] = 'state1_value'
 
-  assert utils.simplify_events(runner.run('test1')) == [
+  assert testing_utils.simplify_events(runner.run('test1')) == [
       ('root_agent', function_call_custom),
       ('root_agent', function_response_custom),
       ('root_agent', 'response2'),
