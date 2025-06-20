@@ -16,6 +16,8 @@
 import base64
 import json
 import logging
+import os
+import datetime
 from typing import Any
 from typing import AsyncGenerator
 from typing import cast
@@ -725,6 +727,88 @@ def _build_request_log(req: LlmRequest) -> str:
   return ""
 
 
+def _log_chat_history_to_file(llm_request, model_type: str = "LiteLLM", agent_name: str = None):
+  """Logs chat history to a dedicated file for debugging purposes.
+  
+  Args:
+    llm_request: The LLM request containing conversation history
+    model_type: Type of model making the request (e.g., "Google LLM", "LiteLLM")
+    agent_name: Name of the agent from the agent tree making this request
+  """
+  try:
+    # Create logs directory if it doesn't exist
+    log_dir = "chat_history_logs"
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Create filename with timestamp
+    timestamp = datetime.datetime.now().strftime("%Y%m%d")
+    log_file = os.path.join(log_dir, f"chat_history_{timestamp}.log")
+    
+    # Determine agent identifier
+    agent_identifier = agent_name if agent_name else "Unknown Agent"
+    
+    with open(log_file, "a", encoding="utf-8") as f:
+      f.write(f"\n{'='*100}\n")
+      f.write(f"AGENT: {agent_identifier}\n")
+      f.write(f"TIMESTAMP: {datetime.datetime.now().isoformat()}\n")
+      f.write(f"MODEL: {llm_request.model} ({model_type})\n")
+      f.write(f"{'='*100}\n\n")
+      
+      # Log available tools
+      if llm_request.config.tools:
+        f.write("AVAILABLE TOOLS:\n")
+        for tool in llm_request.config.tools:
+          if hasattr(tool, 'function_declarations'):
+            for func_decl in tool.function_declarations:
+              f.write(f"  • {func_decl.name}: {func_decl.description}\n")
+        f.write(f"{'-'*80}\n\n")
+      
+      # Log conversation history with agent context
+      f.write(f"CHAT HISTORY FOR {agent_identifier}:\n")
+      for i, content in enumerate(llm_request.contents):
+        # Determine if this is the agent or user/system
+        if content.role == 'user':
+          role_display = "USER"
+        elif content.role == 'model':
+          role_display = f"{agent_identifier} (AGENT)"
+        else:
+          role_display = content.role.upper()
+          
+        f.write(f"\n[{i+1}] {role_display}:\n")
+        
+        for j, part in enumerate(content.parts):
+          if part.function_call:
+            args_dict = dict(part.function_call.args) if hasattr(part.function_call, 'args') else {}
+            f.write(f"  → Calling Tool: {part.function_call.name}\n")
+            f.write(f"    Arguments: {json.dumps(args_dict, indent=4, ensure_ascii=False)}\n")
+            
+          elif part.function_response:
+            response_data = part.function_response.response if hasattr(part.function_response, 'response') else 'no response'
+            f.write(f"  ← Tool Response: {part.function_response.name}\n")
+            if isinstance(response_data, (dict, list)):
+              f.write(f"    Result: {json.dumps(response_data, indent=4, ensure_ascii=False)}\n")
+            else:
+              f.write(f"    Result: {str(response_data)}\n")
+            
+          elif part.text:
+            # Split long text into readable chunks
+            text_content = part.text.strip()
+            if len(text_content) > 200:
+              f.write(f"  Message: {text_content[:200]}...\n")
+              f.write(f"  [Full message length: {len(text_content)} characters]\n")
+            else:
+              f.write(f"  Message: {text_content}\n")
+            
+          elif part.inline_data:
+            f.write(f"  📎 Attachment: {part.inline_data.mime_type if hasattr(part.inline_data, 'mime_type') else 'unknown type'}\n")
+            f.write(f"    Size: {len(str(part.inline_data.data)) if hasattr(part.inline_data, 'data') else 'unknown'} bytes\n")
+      
+      f.write(f"\n{'='*100}\n\n")
+      
+  except Exception as e:
+    logger.warning(f"Failed to log chat history to file: {e}")
+
+
 class LiteLlm(BaseLlm):
   """Wrapper around litellm.
 
@@ -787,6 +871,9 @@ class LiteLlm(BaseLlm):
     Yields:
       LlmResponse: The model response.
     """
+
+    # Log chat history to file for debugging
+    _log_chat_history_to_file(llm_request, "LiteLLM")
 
     logger.info(_build_request_log(llm_request))
 

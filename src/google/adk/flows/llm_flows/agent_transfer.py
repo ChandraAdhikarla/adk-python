@@ -96,19 +96,13 @@ If another agent is better for answering the question according to its
 description, call `{_TRANSFER_TO_AGENT_FUNCTION_NAME}` function to transfer the
 question to that agent. When transferring, do not generate any text other than
 the function call.
-
-IMPORTANT INSTRUCTIONS FOR AGENT TRANSFER:
-1. To transfer to Deployment agent: `{_TRANSFER_TO_AGENT_FUNCTION_NAME}(agent_name="Deployment")`
-2. To transfer to Support agent: `{_TRANSFER_TO_AGENT_FUNCTION_NAME}(agent_name="Support")`
-3. DO NOT try to call agents directly by name (no `Deployment()` or `Support()`).
-4. Always use quotes around the agent name in the transfer function.
 """
 
-  if agent.parent_agent:
+  if agent.parent_agent and not agent.disallow_transfer_to_parent:
     si += f"""
 Your parent agent is {agent.parent_agent.name}. If neither the other agents nor
 you are best for answering the question according to the descriptions, transfer
-to your parent agent. If you don't have parent agent, try answer by yourself.
+to your parent agent.
 """
   return si
 

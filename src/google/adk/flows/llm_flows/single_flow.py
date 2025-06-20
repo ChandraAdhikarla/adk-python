@@ -22,7 +22,7 @@ from . import _nl_planning
 from . import basic
 from . import contents
 from . import identity
-from . import instructions
+# from . import instructions
 from .base_llm_flow import BaseLlmFlow
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ class SingleFlow(BaseLlmFlow):
     self.request_processors += [
         basic.request_processor,
         auth_preprocessor.request_processor,
-        instructions.request_processor,
+        # instructions.request_processor,
         identity.request_processor,
         contents.request_processor,
         # Some implementations of NL Planning mark planning contents as thoughts

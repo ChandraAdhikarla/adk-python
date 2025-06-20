@@ -59,15 +59,43 @@ request_processor = _ContentLlmRequestProcessor()
 
 
 def _merge_contents(contents: list[types.Content]) -> list[types.Content]:
-  """Merges contents with the same role."""
+  """Merges contents with the same role, respecting Google's function call turn-taking rules."""
   if not contents:
     return []
 
   merged_contents = [contents[0]]
   for content in contents[1:]:
+    last_content = merged_contents[-1]
+    
     # Do not merge if the previous content has a function_call, as it must be
-    # the last part of the content.
-    if merged_contents[-1].role == content.role:
+    # the last part of the content for Google's turn-taking requirements
+    has_function_call = (
+        last_content.parts and 
+        any(part.function_call for part in last_content.parts)
+    )
+    
+    # Do not merge if current content has function_response and previous doesn't,
+    # or vice versa, to maintain proper function call/response pairing
+    last_has_function_response = (
+        last_content.parts and 
+        any(part.function_response for part in last_content.parts)
+    )
+    current_has_function_response = (
+        content.parts and 
+        any(part.function_response for part in content.parts)
+    )
+    
+    # Special case: Always merge user text that comes after function response
+    # This is critical for Google's turn-taking requirements
+    should_merge_after_function_response = (
+        last_content.role == 'user' and content.role == 'user' and
+        last_has_function_response and not current_has_function_response
+    )
+    
+    # Only merge if same role AND no function call conflicts AND (function response consistency OR special case)
+    if (last_content.role == content.role and 
+        not has_function_call and 
+        (last_has_function_response == current_has_function_response or should_merge_after_function_response)):
       merged_contents[-1].parts.extend(content.parts)
     else:
       merged_contents.append(content)
@@ -245,7 +273,7 @@ def _get_contents(
     content = copy.deepcopy(event.content)
     remove_client_function_call_id(content)
     contents.append(content)
-  contents = _merge_contents(contents)
+  # contents = _merge_contents(contents)
   return contents
 
 

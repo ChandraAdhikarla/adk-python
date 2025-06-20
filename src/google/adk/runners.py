@@ -18,6 +18,9 @@ import asyncio
 import logging
 import queue
 import threading
+import json
+import os
+from datetime import datetime
 from typing import AsyncGenerator
 from typing import Generator
 from typing import Optional
@@ -84,6 +87,7 @@ class Runner:
       session_service: BaseSessionService,
       memory_service: Optional[BaseMemoryService] = None,
       log_service: Optional['BaseLogService'] = None,
+      debug_log_file: Optional[str] = None,
   ):
     """Initializes the Runner.
 
@@ -94,6 +98,7 @@ class Runner:
         session_service: The session service for the runner.
         memory_service: The memory service for the runner.
         log_service: Optional log service to use for logging.
+        debug_log_file: Optional path to debug log file for chat transcripts.
     """
     self.app_name = app_name
     self.agent = agent
@@ -102,7 +107,6 @@ class Runner:
     self.memory_service = memory_service
     self.log_service = log_service
     
-    # Register the root agent and all sub-agents with the log service
     # This will help with using proper display names in logs
     if log_service and hasattr(log_service, 'register_agent_name'):
       self._register_agent_display_names(agent, log_service)
@@ -193,32 +197,20 @@ class Runner:
           new_message=new_message,
           run_config=run_config,
       )
-      root_agent = self.agent
-
-      if new_message:
-        self._append_new_message_to_session(
+      root_agent = self.agent  
+            
+      self._append_new_message_to_session(
             session,
             new_message,
             invocation_context,
             run_config.save_input_blobs_as_artifacts,
-        )
+      )
 
-      invocation_context.agent = self._find_agent_to_run(session, root_agent)
+      selected_agent = self._find_agent_to_run(session, root_agent)
+      invocation_context.agent = selected_agent
       async for event in invocation_context.agent.run_async(invocation_context):
         if not event.partial:
-          self.session_service.append_event(session=session, event=event)
-        
-        # Auto-detect text-based transfers and convert to actual transfers
-        if self._detect_text_transfer(event):
-          transfer_target = self._extract_transfer_target(event)
-          if transfer_target:
-            # Create a synthetic transfer action
-            if not event.actions:
-              from .events.event_actions import EventActions
-              event.actions = EventActions()
-            event.actions.transfer_to_agent = transfer_target
-            logger.info(f"Auto-converted text transfer to action: {transfer_target}")
-        
+          self.session_service.append_event(session=session, event=event)        
         yield event
 
   def _append_new_message_to_session(
@@ -334,25 +326,36 @@ class Runner:
   ) -> BaseAgent:
     """Finds the agent to run to continue the session.
 
-    For new user input, always start with the root agent (orchestrator).
-    This ensures clean conversation flow where:
-    - Root agent handles all user interactions
-    - Root agent delegates to appropriate sub-agents  
-    - Sub-agents transfer back to root when complete
-    - Root agent provides final responses
+    A qualified agent must be either of:
+    - The root agent;
+    - An LlmAgent who replied last and is capable to transfer to any other agent
+      in the agent hierarchy.
 
     Args:
         session: The session to find the agent for.
         root_agent: The root agent of the runner.
 
     Returns:
-      Always returns the root agent for new user input.
+      The agent of the last message in the session or the root agent.
     """
-    
-    # Always start with root agent for new user input
-    # This ensures the orchestrator maintains full control of conversation flow
-    logger.info(f"Selecting root agent for new user input: {root_agent.name}")
+    for event in filter(lambda e: e.author != 'user', reversed(session.events)):
+      if event.author == root_agent.name:
+        # Found root agent.
+        return root_agent
+      if not (agent := root_agent.find_sub_agent(event.author)):
+        # Agent not found, continue looking.
+        logger.warning(
+            'Event from an unknown agent: %s, event id: %s',
+            event.author,
+            event.id,
+        )
+        continue
+      if self._is_transferable_across_agent_tree(agent):
+        return agent
+    # Falls back to root agent if no suitable agents are found in the session.
     return root_agent
+
+
 
   def _is_transferable_across_agent_tree(self, agent_to_run: BaseAgent) -> bool:
     """Whether the agent to run can transfer to any other agent in the agent tree.
@@ -479,51 +482,6 @@ class Runner:
         for sub_agent in agent.sub_agents:
             self._register_agent_display_names(sub_agent, log_service)
 
-  def _detect_text_transfer(self, event: Event) -> bool:
-    """Detect if an event contains a text-based transfer mention."""
-    if not event.content or not event.content.parts:
-      return False
-    
-    # Check if this event already has a transfer action
-    if (hasattr(event, 'actions') and event.actions and 
-        hasattr(event.actions, 'transfer_to_agent') and 
-        event.actions.transfer_to_agent):
-      return False
-    
-    # Look for transfer mentions in text
-    for part in event.content.parts:
-      if hasattr(part, 'text') and part.text:
-        text = part.text.lower()
-        if 'transfer_to_agent(' in text:
-          return True
-    
-    return False
-
-  def _extract_transfer_target(self, event: Event) -> Optional[str]:
-    """Extract the target agent name from text-based transfer mentions."""
-    import re
-    
-    for part in event.content.parts:
-      if hasattr(part, 'text') and part.text:
-        # Look for patterns like: transfer_to_agent(agent_name="AgentName")
-        # or transfer_to_agent("AgentName")
-        patterns = [
-          r'transfer_to_agent\(\s*agent_name\s*=\s*["\']([^"\']+)["\']',
-          r'transfer_to_agent\(\s*["\']([^"\']+)["\']',
-          r'transfer_to_agent\(\s*agent_name\s*=\s*([^,\)]+)',
-        ]
-        
-        for pattern in patterns:
-          match = re.search(pattern, part.text, re.IGNORECASE)
-          if match:
-            agent_name = match.group(1).strip()
-            # Validate agent exists in the tree
-            root_agent = event.author and hasattr(self, 'agent') and self.agent
-            if root_agent and (agent_name == root_agent.name or 
-                              root_agent.find_sub_agent(agent_name)):
-              return agent_name
-    
-    return None
 
 
 class InMemoryRunner(Runner):
